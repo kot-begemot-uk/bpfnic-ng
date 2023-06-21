@@ -7,10 +7,10 @@ kernel-to-userspace API.
 
 # build
 
-The use example use relies on the pybpfmap python package available at: https://github.com/kot-begemot-uk/pybpfmap
+The example relies on the pybpfmap python package available at: https://github.com/kot-begemot-uk/pybpfmap
 
 1. Build pybpfmap
-1. Patch a reasonably recent kernel using the export-ringbuf.patch.
+1. Patch a reasonably recent kernel using the export-ringbuf.patch. The patch is versus 6.1.32. It should apply to most recent kernels.
 1. Build the kernel
 1. Build the code as an out-of-tree module
 
