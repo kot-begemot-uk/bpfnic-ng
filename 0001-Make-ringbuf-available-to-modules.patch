@@ -1,0 +1,254 @@
+From ca9126924469deb99bf3aba767716176c75ad76c Mon Sep 17 00:00:00 2001
+From: Anton Ivanov <anton.ivanov@cambridgegreys.com>
+Date: Wed, 21 Jun 2023 08:53:15 +0100
+Subject: [PATCH] Make ringbuf available to modules
+
+ringbuf which was developed as a part of BPF infrastructure is
+a very nice, clean, simple and consise API to relay information
+from the kernel to userspace. It can be used in critical sections,
+interrupt handlers, etc.
+
+This patch exports ringbuf functionality to make it available to
+kernel modules.
+
+Demo: https://github.com/kot-begemot-uk/bpfnic-ng
+
+The demo ships to userspace hardware offload notifications
+without any mallocs, any workqueue and/or delayed work which
+is normally needed to handle these. As a result it is ~ 150
+lines of code instead of the 500+ usually needed to achieve the
+same result.
+
+Signed-off-by: Anton Ivanov <anton.ivanov@cambridgegreys.com>
+---
+ include/linux/bpf.h  | 16 ++++++++++++
+ kernel/bpf/inode.c   | 43 ++++++++++++++++++++++++++++++
+ kernel/bpf/ringbuf.c | 62 ++++++++++++++++++++++++++++++++++++++------
+ 3 files changed, 113 insertions(+), 8 deletions(-)
+
+diff --git a/include/linux/bpf.h b/include/linux/bpf.h
+index 942f9ac9fa7b..f5311fe924c4 100644
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -1759,6 +1759,20 @@ int  generic_map_delete_batch(struct bpf_map *map,
+ struct bpf_map *bpf_map_get_curr_or_next(u32 *id);
+ struct bpf_prog *bpf_prog_get_curr_or_next(u32 *id);
+ 
++void *bpf_ringbuf_reserve_kernel(struct bpf_map *map,
++				 u64 size, u64 flags);
++void bpf_ringbuf_commit_kernel(void *sample, u64 flags);
++void bpf_ringbuf_discard_kernel(void *sample, u64 flags);
++int bpf_ringbuf_output_kernel(struct bpf_map *map,
++			      void *data, u64 size, u64 flags);
++int bpf_ringbuf_query_kernel(struct bpf_map *map, u64 flags);
++int bpf_user_ringbuf_drain_kernel(struct bpf_map *map,
++				  void *callback_fn,
++				  void *callback_ctx,
++				  u64 flags);
++
++
++
+ #ifdef CONFIG_MEMCG_KMEM
+ void *bpf_map_kmalloc_node(const struct bpf_map *map, size_t size, gfp_t flags,
+ 			   int node);
+@@ -1997,6 +2011,8 @@ static inline int bpf_map_attr_numa_node(const union bpf_attr *attr)
+ }
+ 
+ struct bpf_prog *bpf_prog_get_type_path(const char *name, enum bpf_prog_type type);
++struct bpf_map *bpf_map_get_path(const char *name, fmode_t fmod);
++
+ int array_map_alloc_check(union bpf_attr *attr);
+ 
+ int bpf_prog_test_run_xdp(struct bpf_prog *prog, const union bpf_attr *kattr,
+diff --git a/kernel/bpf/inode.c b/kernel/bpf/inode.c
+index 4f841e16779e..b10e97b63df1 100644
+--- a/kernel/bpf/inode.c
++++ b/kernel/bpf/inode.c
+@@ -598,6 +598,49 @@ struct bpf_prog *bpf_prog_get_type_path(const char *name, enum bpf_prog_type typ
+ }
+ EXPORT_SYMBOL(bpf_prog_get_type_path);
+ 
++static struct bpf_map *__get_map_inode(struct inode *inode, fmode_t fmode)
++{
++	struct bpf_map *map;
++	int ret = inode_permission(&init_user_ns, inode, MAY_READ);
++
++	if (ret)
++		return ERR_PTR(ret);
++
++	if (inode->i_op == &bpf_prog_iops)
++		return ERR_PTR(-EINVAL);
++	if (inode->i_op == &bpf_link_iops)
++		return ERR_PTR(-EINVAL);
++	if (inode->i_op != &bpf_map_iops)
++		return ERR_PTR(-EPERM);
++
++	map = inode->i_private;
++
++	ret = security_bpf_map(map, fmode);
++
++	if (ret < 0)
++		return ERR_PTR(ret);
++
++	bpf_map_inc(map);
++	return map;
++}
++
++struct bpf_map *bpf_map_get_path(const char *name, fmode_t fmode)
++{
++	struct bpf_map *map;
++	struct path path;
++	int ret = kern_path(name, LOOKUP_FOLLOW, &path);
++
++	if (ret)
++		return ERR_PTR(ret);
++	map = __get_map_inode(d_backing_inode(path.dentry), fmode);
++	if (!IS_ERR(map))
++		touch_atime(&path);
++	path_put(&path);
++	return map;
++}
++EXPORT_SYMBOL(bpf_map_get_path);
++
++
+ /*
+  * Display the mount options in /proc/mounts.
+  */
+diff --git a/kernel/bpf/ringbuf.c b/kernel/bpf/ringbuf.c
+index 9e832acf4692..e8cc68999ff2 100644
+--- a/kernel/bpf/ringbuf.c
++++ b/kernel/bpf/ringbuf.c
+@@ -434,15 +434,21 @@ static void *__bpf_ringbuf_reserve(struct bpf_ringbuf *rb, u64 size)
+ 	return (void *)hdr + BPF_RINGBUF_HDR_SZ;
+ }
+ 
+-BPF_CALL_3(bpf_ringbuf_reserve, struct bpf_map *, map, u64, size, u64, flags)
++void *bpf_ringbuf_reserve_kernel(struct bpf_map *map, u64 size, u64 flags)
+ {
+ 	struct bpf_ringbuf_map *rb_map;
+ 
+ 	if (unlikely(flags))
+-		return 0;
++		return NULL;
+ 
+ 	rb_map = container_of(map, struct bpf_ringbuf_map, map);
+-	return (unsigned long)__bpf_ringbuf_reserve(rb_map->rb, size);
++	return __bpf_ringbuf_reserve(rb_map->rb, size);
++}
++EXPORT_SYMBOL(bpf_ringbuf_reserve_kernel);
++
++BPF_CALL_3(bpf_ringbuf_reserve, struct bpf_map *, map, u64, size, u64, flags)
++{
++	return (unsigned long)bpf_ringbuf_reserve_kernel(map, size, flags);
+ }
+ 
+ const struct bpf_func_proto bpf_ringbuf_reserve_proto = {
+@@ -481,6 +487,12 @@ static void bpf_ringbuf_commit(void *sample, u64 flags, bool discard)
+ 		irq_work_queue(&rb->work);
+ }
+ 
++void bpf_ringbuf_commit_kernel(void *sample, u64 flags)
++{
++	bpf_ringbuf_commit(sample, flags, false);
++}
++EXPORT_SYMBOL(bpf_ringbuf_commit_kernel);
++
+ BPF_CALL_2(bpf_ringbuf_submit, void *, sample, u64, flags)
+ {
+ 	bpf_ringbuf_commit(sample, flags, false /* discard */);
+@@ -494,6 +506,12 @@ const struct bpf_func_proto bpf_ringbuf_submit_proto = {
+ 	.arg2_type	= ARG_ANYTHING,
+ };
+ 
++void bpf_ringbuf_discard_kernel(void *sample, u64 flags)
++{
++	bpf_ringbuf_commit(sample, flags, true);
++}
++EXPORT_SYMBOL(bpf_ringbuf_discard_kernel);
++
+ BPF_CALL_2(bpf_ringbuf_discard, void *, sample, u64, flags)
+ {
+ 	bpf_ringbuf_commit(sample, flags, true /* discard */);
+@@ -507,8 +525,8 @@ const struct bpf_func_proto bpf_ringbuf_discard_proto = {
+ 	.arg2_type	= ARG_ANYTHING,
+ };
+ 
+-BPF_CALL_4(bpf_ringbuf_output, struct bpf_map *, map, void *, data, u64, size,
+-	   u64, flags)
++int bpf_ringbuf_output_kernel(struct bpf_map *map, void *data, u64 size,
++	   u64 flags)
+ {
+ 	struct bpf_ringbuf_map *rb_map;
+ 	void *rec;
+@@ -525,6 +543,13 @@ BPF_CALL_4(bpf_ringbuf_output, struct bpf_map *, map, void *, data, u64, size,
+ 	bpf_ringbuf_commit(rec, flags, false /* discard */);
+ 	return 0;
+ }
++EXPORT_SYMBOL(bpf_ringbuf_output_kernel);
++
++BPF_CALL_4(bpf_ringbuf_output, struct bpf_map *, map, void *, data, u64, size,
++	   u64, flags)
++{
++	return bpf_ringbuf_output_kernel(map, data, size, flags);
++}
+ 
+ const struct bpf_func_proto bpf_ringbuf_output_proto = {
+ 	.func		= bpf_ringbuf_output,
+@@ -535,7 +560,7 @@ const struct bpf_func_proto bpf_ringbuf_output_proto = {
+ 	.arg4_type	= ARG_ANYTHING,
+ };
+ 
+-BPF_CALL_2(bpf_ringbuf_query, struct bpf_map *, map, u64, flags)
++int bpf_ringbuf_query_kernel(struct bpf_map *map, u64 flags)
+ {
+ 	struct bpf_ringbuf *rb;
+ 
+@@ -554,6 +579,12 @@ BPF_CALL_2(bpf_ringbuf_query, struct bpf_map *, map, u64, flags)
+ 		return 0;
+ 	}
+ }
++EXPORT_SYMBOL(bpf_ringbuf_query_kernel);
++
++BPF_CALL_2(bpf_ringbuf_query, struct bpf_map *, map, u64, flags)
++{
++	return bpf_ringbuf_query_kernel(map, flags);
++}
+ 
+ const struct bpf_func_proto bpf_ringbuf_query_proto = {
+ 	.func		= bpf_ringbuf_query,
+@@ -709,8 +740,8 @@ static void __bpf_user_ringbuf_sample_release(struct bpf_ringbuf *rb, size_t siz
+ 	smp_store_release(&rb->consumer_pos, consumer_pos + rounded_size);
+ }
+ 
+-BPF_CALL_4(bpf_user_ringbuf_drain, struct bpf_map *, map,
+-	   void *, callback_fn, void *, callback_ctx, u64, flags)
++int __bpf_user_ringbuf_drain(struct bpf_map *map,
++	   void *callback_fn, void *callback_ctx, u64 flags)
+ {
+ 	struct bpf_ringbuf *rb;
+ 	long samples, discarded_samples = 0, ret = 0;
+@@ -766,6 +797,21 @@ BPF_CALL_4(bpf_user_ringbuf_drain, struct bpf_map *, map,
+ 	return ret;
+ }
+ 
++BPF_CALL_4(bpf_user_ringbuf_drain, struct bpf_map *, map,
++	   void *, callback_fn, void *, callback_ctx, u64, flags)
++{
++	return __bpf_user_ringbuf_drain(map, callback_fn, callback_ctx, flags);
++}
++
++
++int bpf_user_ringbuf_drain_kernel(struct bpf_map *map,
++	   void *callback_fn, void *callback_ctx, u64 flags)
++{
++	return __bpf_user_ringbuf_drain(map, callback_fn, callback_ctx, flags);
++}
++EXPORT_SYMBOL(bpf_user_ringbuf_drain_kernel);
++
++
+ const struct bpf_func_proto bpf_user_ringbuf_drain_proto = {
+ 	.func		= bpf_user_ringbuf_drain,
+ 	.ret_type	= RET_INTEGER,
+-- 
+2.30.2
+
