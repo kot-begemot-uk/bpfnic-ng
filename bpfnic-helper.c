@@ -62,10 +62,10 @@ static int bpfnic_switchdev_event(struct notifier_block *unused,
 	case SWITCHDEV_FDB_ADD_TO_DEVICE:
 	case SWITCHDEV_FDB_DEL_TO_DEVICE:
 		if (to_user) {
-			fdb_entry = bpf_ringbuf_reserve_kernel(to_user, sizeof(struct bpfnic_fdb_entry), 0);
+			fdb_entry = _bpf_ringbuf_reserve(to_user, sizeof(struct bpfnic_fdb_entry), 0);
 			if (fdb_entry) {
 				build_ringbuf_entry(fdb_entry, fdb_info, event);
-				bpf_ringbuf_commit_kernel(fdb_entry, 0);
+				_bpf_ringbuf_commit(fdb_entry, 0);
 			} else
 				return NOTIFY_BAD;
 		}

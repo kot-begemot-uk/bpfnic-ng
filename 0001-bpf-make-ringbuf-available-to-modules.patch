@@ -1,7 +1,7 @@
-From ca9126924469deb99bf3aba767716176c75ad76c Mon Sep 17 00:00:00 2001
+From 38ca48d498824273dd7bb137d72c43010bc10ee0 Mon Sep 17 00:00:00 2001
 From: Anton Ivanov <anton.ivanov@cambridgegreys.com>
 Date: Wed, 21 Jun 2023 08:53:15 +0100
-Subject: [PATCH] Make ringbuf available to modules
+Subject: [PATCH] bpf: make ringbuf available to modules
 
 ringbuf which was developed as a part of BPF infrastructure is
 a very nice, clean, simple and consise API to relay information
@@ -27,21 +27,21 @@ Signed-off-by: Anton Ivanov <anton.ivanov@cambridgegreys.com>
  3 files changed, 113 insertions(+), 8 deletions(-)
 
 diff --git a/include/linux/bpf.h b/include/linux/bpf.h
-index 942f9ac9fa7b..f5311fe924c4 100644
+index f58895830ada..0882ba4a44dd 100644
 --- a/include/linux/bpf.h
 +++ b/include/linux/bpf.h
-@@ -1759,6 +1759,20 @@ int  generic_map_delete_batch(struct bpf_map *map,
+@@ -2004,6 +2004,20 @@ int  generic_map_delete_batch(struct bpf_map *map,
  struct bpf_map *bpf_map_get_curr_or_next(u32 *id);
  struct bpf_prog *bpf_prog_get_curr_or_next(u32 *id);
  
-+void *bpf_ringbuf_reserve_kernel(struct bpf_map *map,
++void *_bpf_ringbuf_reserve(struct bpf_map *map,
 +				 u64 size, u64 flags);
-+void bpf_ringbuf_commit_kernel(void *sample, u64 flags);
-+void bpf_ringbuf_discard_kernel(void *sample, u64 flags);
-+int bpf_ringbuf_output_kernel(struct bpf_map *map,
++void _bpf_ringbuf_commit(void *sample, u64 flags);
++void _bpf_ringbuf_discard(void *sample, u64 flags);
++int _bpf_ringbuf_output(struct bpf_map *map,
 +			      void *data, u64 size, u64 flags);
-+int bpf_ringbuf_query_kernel(struct bpf_map *map, u64 flags);
-+int bpf_user_ringbuf_drain_kernel(struct bpf_map *map,
++int _bpf_ringbuf_query(struct bpf_map *map, u64 flags);
++int _bpf_user_ringbuf_drain(struct bpf_map *map,
 +				  void *callback_fn,
 +				  void *callback_ctx,
 +				  u64 flags);
@@ -51,7 +51,7 @@ index 942f9ac9fa7b..f5311fe924c4 100644
  #ifdef CONFIG_MEMCG_KMEM
  void *bpf_map_kmalloc_node(const struct bpf_map *map, size_t size, gfp_t flags,
  			   int node);
-@@ -1997,6 +2011,8 @@ static inline int bpf_map_attr_numa_node(const union bpf_attr *attr)
+@@ -2245,6 +2259,8 @@ static inline int bpf_map_attr_numa_node(const union bpf_attr *attr)
  }
  
  struct bpf_prog *bpf_prog_get_type_path(const char *name, enum bpf_prog_type type);
@@ -61,17 +61,17 @@ index 942f9ac9fa7b..f5311fe924c4 100644
  
  int bpf_prog_test_run_xdp(struct bpf_prog *prog, const union bpf_attr *kattr,
 diff --git a/kernel/bpf/inode.c b/kernel/bpf/inode.c
-index 4f841e16779e..b10e97b63df1 100644
+index 4174f76133df..0518f122df68 100644
 --- a/kernel/bpf/inode.c
 +++ b/kernel/bpf/inode.c
-@@ -598,6 +598,49 @@ struct bpf_prog *bpf_prog_get_type_path(const char *name, enum bpf_prog_type typ
+@@ -597,6 +597,49 @@ struct bpf_prog *bpf_prog_get_type_path(const char *name, enum bpf_prog_type typ
  }
  EXPORT_SYMBOL(bpf_prog_get_type_path);
  
 +static struct bpf_map *__get_map_inode(struct inode *inode, fmode_t fmode)
 +{
 +	struct bpf_map *map;
-+	int ret = inode_permission(&init_user_ns, inode, MAY_READ);
++	int ret = inode_permission(&nop_mnt_idmap, inode, MAY_READ);
 +
 +	if (ret)
 +		return ERR_PTR(ret);
@@ -115,15 +115,15 @@ index 4f841e16779e..b10e97b63df1 100644
   * Display the mount options in /proc/mounts.
   */
 diff --git a/kernel/bpf/ringbuf.c b/kernel/bpf/ringbuf.c
-index 9e832acf4692..e8cc68999ff2 100644
+index 875ac9b698d9..4d4750b9f963 100644
 --- a/kernel/bpf/ringbuf.c
 +++ b/kernel/bpf/ringbuf.c
-@@ -434,15 +434,21 @@ static void *__bpf_ringbuf_reserve(struct bpf_ringbuf *rb, u64 size)
+@@ -452,15 +452,21 @@ static void *__bpf_ringbuf_reserve(struct bpf_ringbuf *rb, u64 size)
  	return (void *)hdr + BPF_RINGBUF_HDR_SZ;
  }
  
 -BPF_CALL_3(bpf_ringbuf_reserve, struct bpf_map *, map, u64, size, u64, flags)
-+void *bpf_ringbuf_reserve_kernel(struct bpf_map *map, u64 size, u64 flags)
++void *_bpf_ringbuf_reserve(struct bpf_map *map, u64 size, u64 flags)
  {
  	struct bpf_ringbuf_map *rb_map;
  
@@ -135,88 +135,88 @@ index 9e832acf4692..e8cc68999ff2 100644
 -	return (unsigned long)__bpf_ringbuf_reserve(rb_map->rb, size);
 +	return __bpf_ringbuf_reserve(rb_map->rb, size);
 +}
-+EXPORT_SYMBOL(bpf_ringbuf_reserve_kernel);
++EXPORT_SYMBOL(_bpf_ringbuf_reserve);
 +
 +BPF_CALL_3(bpf_ringbuf_reserve, struct bpf_map *, map, u64, size, u64, flags)
 +{
-+	return (unsigned long)bpf_ringbuf_reserve_kernel(map, size, flags);
++	return (unsigned long)_bpf_ringbuf_reserve(map, size, flags);
  }
  
  const struct bpf_func_proto bpf_ringbuf_reserve_proto = {
-@@ -481,6 +487,12 @@ static void bpf_ringbuf_commit(void *sample, u64 flags, bool discard)
+@@ -499,6 +505,12 @@ static void bpf_ringbuf_commit(void *sample, u64 flags, bool discard)
  		irq_work_queue(&rb->work);
  }
  
-+void bpf_ringbuf_commit_kernel(void *sample, u64 flags)
++void _bpf_ringbuf_commit(void *sample, u64 flags)
 +{
 +	bpf_ringbuf_commit(sample, flags, false);
 +}
-+EXPORT_SYMBOL(bpf_ringbuf_commit_kernel);
++EXPORT_SYMBOL(_bpf_ringbuf_commit);
 +
  BPF_CALL_2(bpf_ringbuf_submit, void *, sample, u64, flags)
  {
  	bpf_ringbuf_commit(sample, flags, false /* discard */);
-@@ -494,6 +506,12 @@ const struct bpf_func_proto bpf_ringbuf_submit_proto = {
+@@ -512,6 +524,12 @@ const struct bpf_func_proto bpf_ringbuf_submit_proto = {
  	.arg2_type	= ARG_ANYTHING,
  };
  
-+void bpf_ringbuf_discard_kernel(void *sample, u64 flags)
++void _bpf_ringbuf_discard(void *sample, u64 flags)
 +{
 +	bpf_ringbuf_commit(sample, flags, true);
 +}
-+EXPORT_SYMBOL(bpf_ringbuf_discard_kernel);
++EXPORT_SYMBOL(_bpf_ringbuf_discard);
 +
  BPF_CALL_2(bpf_ringbuf_discard, void *, sample, u64, flags)
  {
  	bpf_ringbuf_commit(sample, flags, true /* discard */);
-@@ -507,8 +525,8 @@ const struct bpf_func_proto bpf_ringbuf_discard_proto = {
+@@ -525,8 +543,8 @@ const struct bpf_func_proto bpf_ringbuf_discard_proto = {
  	.arg2_type	= ARG_ANYTHING,
  };
  
 -BPF_CALL_4(bpf_ringbuf_output, struct bpf_map *, map, void *, data, u64, size,
 -	   u64, flags)
-+int bpf_ringbuf_output_kernel(struct bpf_map *map, void *data, u64 size,
++int _bpf_ringbuf_output(struct bpf_map *map, void *data, u64 size,
 +	   u64 flags)
  {
  	struct bpf_ringbuf_map *rb_map;
  	void *rec;
-@@ -525,6 +543,13 @@ BPF_CALL_4(bpf_ringbuf_output, struct bpf_map *, map, void *, data, u64, size,
+@@ -543,6 +561,13 @@ BPF_CALL_4(bpf_ringbuf_output, struct bpf_map *, map, void *, data, u64, size,
  	bpf_ringbuf_commit(rec, flags, false /* discard */);
  	return 0;
  }
-+EXPORT_SYMBOL(bpf_ringbuf_output_kernel);
++EXPORT_SYMBOL(_bpf_ringbuf_output);
 +
 +BPF_CALL_4(bpf_ringbuf_output, struct bpf_map *, map, void *, data, u64, size,
 +	   u64, flags)
 +{
-+	return bpf_ringbuf_output_kernel(map, data, size, flags);
++	return _bpf_ringbuf_output(map, data, size, flags);
 +}
  
  const struct bpf_func_proto bpf_ringbuf_output_proto = {
  	.func		= bpf_ringbuf_output,
-@@ -535,7 +560,7 @@ const struct bpf_func_proto bpf_ringbuf_output_proto = {
+@@ -553,7 +578,7 @@ const struct bpf_func_proto bpf_ringbuf_output_proto = {
  	.arg4_type	= ARG_ANYTHING,
  };
  
 -BPF_CALL_2(bpf_ringbuf_query, struct bpf_map *, map, u64, flags)
-+int bpf_ringbuf_query_kernel(struct bpf_map *map, u64 flags)
++int _bpf_ringbuf_query(struct bpf_map *map, u64 flags)
  {
  	struct bpf_ringbuf *rb;
  
-@@ -554,6 +579,12 @@ BPF_CALL_2(bpf_ringbuf_query, struct bpf_map *, map, u64, flags)
+@@ -572,6 +597,12 @@ BPF_CALL_2(bpf_ringbuf_query, struct bpf_map *, map, u64, flags)
  		return 0;
  	}
  }
-+EXPORT_SYMBOL(bpf_ringbuf_query_kernel);
++EXPORT_SYMBOL(_bpf_ringbuf_query);
 +
 +BPF_CALL_2(bpf_ringbuf_query, struct bpf_map *, map, u64, flags)
 +{
-+	return bpf_ringbuf_query_kernel(map, flags);
++	return _bpf_ringbuf_query(map, flags);
 +}
  
  const struct bpf_func_proto bpf_ringbuf_query_proto = {
  	.func		= bpf_ringbuf_query,
-@@ -709,8 +740,8 @@ static void __bpf_user_ringbuf_sample_release(struct bpf_ringbuf *rb, size_t siz
+@@ -727,8 +758,8 @@ static void __bpf_user_ringbuf_sample_release(struct bpf_ringbuf *rb, size_t siz
  	smp_store_release(&rb->consumer_pos, consumer_pos + rounded_size);
  }
  
@@ -227,7 +227,7 @@ index 9e832acf4692..e8cc68999ff2 100644
  {
  	struct bpf_ringbuf *rb;
  	long samples, discarded_samples = 0, ret = 0;
-@@ -766,6 +797,21 @@ BPF_CALL_4(bpf_user_ringbuf_drain, struct bpf_map *, map,
+@@ -784,6 +815,21 @@ BPF_CALL_4(bpf_user_ringbuf_drain, struct bpf_map *, map,
  	return ret;
  }
  
@@ -238,12 +238,12 @@ index 9e832acf4692..e8cc68999ff2 100644
 +}
 +
 +
-+int bpf_user_ringbuf_drain_kernel(struct bpf_map *map,
++int _bpf_user_ringbuf_drain(struct bpf_map *map,
 +	   void *callback_fn, void *callback_ctx, u64 flags)
 +{
 +	return __bpf_user_ringbuf_drain(map, callback_fn, callback_ctx, flags);
 +}
-+EXPORT_SYMBOL(bpf_user_ringbuf_drain_kernel);
++EXPORT_SYMBOL(bpf_user_ringbuf_drain);
 +
 +
  const struct bpf_func_proto bpf_user_ringbuf_drain_proto = {
