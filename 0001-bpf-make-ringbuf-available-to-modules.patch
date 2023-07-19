@@ -1,9 +1,9 @@
-From 38ca48d498824273dd7bb137d72c43010bc10ee0 Mon Sep 17 00:00:00 2001
+From 97755064b49280c043acf32e14d847b0f918afea Mon Sep 17 00:00:00 2001
 From: Anton Ivanov <anton.ivanov@cambridgegreys.com>
 Date: Wed, 21 Jun 2023 08:53:15 +0100
-Subject: [PATCH] bpf: make ringbuf available to modules
+Subject: [PATCH 1/2] bpf: make ringbuf available to modules
 
-ringbuf which was developed as a part of BPF infrastructure is
+Ringbuf which was developed as a part of BPF infrastructure is
 a very nice, clean, simple and consise API to relay information
 from the kernel to userspace. It can be used in critical sections,
 interrupt handlers, etc.

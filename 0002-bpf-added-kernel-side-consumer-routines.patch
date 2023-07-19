@@ -1,0 +1,118 @@
+From 3685d2ef8920ab920b52a61bf77a09164a124bf8 Mon Sep 17 00:00:00 2001
+From: Anton Ivanov <anton.ivanov@cambridgegreys.com>
+Date: Mon, 10 Jul 2023 13:57:17 +0100
+Subject: [PATCH 2/2] bpf: added kernel side consumer routines
+
+This adds kernel side support for bpf ringbuf
+consumers.
+
+This allows bpf->kernel using and userspace->kernel communication
+using ringbuf.
+
+Signed-off-by: Anton Ivanov <anton.ivanov@cambridgegreys.com>
+---
+ include/linux/bpf.h  |  4 ++-
+ kernel/bpf/ringbuf.c | 68 ++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 71 insertions(+), 1 deletion(-)
+
+diff --git a/include/linux/bpf.h b/include/linux/bpf.h
+index 0882ba4a44dd..77b0544059b6 100644
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -2015,7 +2015,9 @@ int _bpf_user_ringbuf_drain(struct bpf_map *map,
+ 				  void *callback_fn,
+ 				  void *callback_ctx,
+ 				  u64 flags);
+-
++void *bpf_ringbuf_fetch_next(struct bpf_map *map, u64 *size);
++int bpf_ringbuf_has_data(struct bpf_map *map);
++void ringbuf_wait_for_data(struct bpf_map *map);
+ 
+ 
+ #ifdef CONFIG_MEMCG_KMEM
+diff --git a/kernel/bpf/ringbuf.c b/kernel/bpf/ringbuf.c
+index 4d4750b9f963..fb3549e1846c 100644
+--- a/kernel/bpf/ringbuf.c
++++ b/kernel/bpf/ringbuf.c
+@@ -154,6 +154,24 @@ static struct bpf_ringbuf *bpf_ringbuf_area_alloc(size_t data_sz, int numa_node)
+ 	return NULL;
+ }
+ 
++void ringbuf_wait_for_data(struct bpf_map *map)
++{
++	struct bpf_ringbuf_map *rb_map;
++	struct bpf_ringbuf *rb;
++
++	unsigned long cons_pos, prod_pos;
++
++	rb_map = container_of(map, struct bpf_ringbuf_map, map);
++	rb = rb_map->rb;
++	cons_pos = smp_load_acquire(&rb->consumer_pos);
++	prod_pos = smp_load_acquire(&rb->producer_pos);
++	while (cons_pos == prod_pos) {
++		wait_event(rb->waitq, true);
++		cons_pos = smp_load_acquire(&rb->consumer_pos);
++		prod_pos = smp_load_acquire(&rb->producer_pos);
++	} 
++}
++
+ static void bpf_ringbuf_notify(struct irq_work *work)
+ {
+ 	struct bpf_ringbuf *rb = container_of(work, struct bpf_ringbuf, work);
+@@ -838,3 +856,53 @@ const struct bpf_func_proto bpf_user_ringbuf_drain_proto = {
+ 	.arg3_type	= ARG_PTR_TO_STACK_OR_NULL,
+ 	.arg4_type	= ARG_ANYTHING,
+ };
++
++void *bpf_ringbuf_fetch_next(struct bpf_map *map, u64 *size)
++{
++	unsigned long cons_pos, flags;
++	struct bpf_ringbuf_hdr *hdr;
++	void *sample = NULL;
++	struct bpf_ringbuf *rb;
++
++	rb = container_of(map, struct bpf_ringbuf_map, map)->rb;
++
++	if (in_nmi()) {
++		if (!spin_trylock_irqsave(&rb->spinlock, flags))
++			return NULL;
++	} else {
++		spin_lock_irqsave(&rb->spinlock, flags);
++	}
++
++	cons_pos = smp_load_acquire(&rb->consumer_pos);
++
++	if (cons_pos == smp_load_acquire(&rb->producer_pos))
++		goto done_fetch;
++
++	hdr = (void *)rb->data + (cons_pos & rb->mask);
++	*size = smp_load_acquire(&hdr->len);
++
++	if (*size & BPF_RINGBUF_BUSY_BIT)
++		goto done_fetch;
++
++	if (!(*size & BPF_RINGBUF_DISCARD_BIT))
++		sample = (void *)hdr + BPF_RINGBUF_HDR_SZ;
++
++	cons_pos += round_up(BPF_RINGBUF_HDR_SZ + *size, BPF_RINGBUF_HDR_SZ);
++	smp_store_release(&rb->consumer_pos, cons_pos);
++
++done_fetch:
++	spin_unlock_irqrestore(&rb->spinlock, flags);
++
++	return sample;
++}
++EXPORT_SYMBOL(bpf_ringbuf_fetch_next);
++
++int bpf_ringbuf_has_data(struct bpf_map *map)
++{
++	struct bpf_ringbuf *rb;
++
++	rb = container_of(map, struct bpf_ringbuf_map, map)->rb;
++
++	return smp_load_acquire(&rb->consumer_pos) != smp_load_acquire(&rb->producer_pos);
++}
++EXPORT_SYMBOL(bpf_ringbuf_has_data);
+-- 
+2.30.2
+
